@@ -1,0 +1,51 @@
+# dsh-auto-context-compress bundle patch.
+#
+# One HOST-plane row, and it has to be host plane:
+#
+#   * it observes `agent/pre-step` for EVERY session, so it cannot live inside
+#     one agent preset;
+#   * it consumes `tokenMeter`, `sessionQuery` and `userQuestions`, all of which
+#     the host composition provides;
+#   * it must NOT sit behind an `isolate` realm. The compaction services it
+#     drives belong to each session's OWN preset realm, and it reaches those
+#     through `ctx.agentPresets.serviceFor(agent, name)` — a realm here would
+#     hide the host services it needs while giving it nothing in return.
+#
+# Every key the row owns is listed here: a patch replaces a row's whole config
+# rather than merging into it.
+
+- insert:
+    - id: auto-context-compress
+      name: dsh-auto-context-compress
+      config:
+        # Master switch. The confirmation card can also turn this off at runtime.
+        enabled: true
+        # Ask the human before every rewrite. Set false ONLY to make pruning
+        # silent again — that is the behaviour this plugin exists to replace.
+        confirm: true
+        # How long a confirmation card waits before it is withdrawn. The card is
+        # fail-closed: on timeout nothing is pruned, and the next turn asks again.
+        confirmTimeoutMs: 120000
+        # Model-free pruning tier: start at 50% of the routed context window.
+        softRatio: 0.5
+        # Summarization tier, delegated to the session's own compaction backend
+        # via `compactIfNeeded`. OFF by default: the shipped presets already
+        # summarize at 0.8 themselves, and this plugin's job is to keep pressure
+        # from ever getting there.
+        escalate: false
+        escalateRatio: 0.75
+        # Used only when no adapter advertises a context window for the route.
+        fallbackSoftTokens: 64000
+        fallbackHardTokens: 96000
+        # How many candidates the confirmation card details before summarizing
+        # the rest as a count.
+        maxDetailCandidates: 8
+        previewHeadChars: 220
+        previewTailChars: 120
+
+        # ── browser-half keys ────────────────────────────────────────────────
+        # Both halves receive this SAME config object. The host ignores these
+        # three; lib/client.js reads them for the floating readout window.
+        visible: true
+        pollMs: 2000
+        position: top-right
