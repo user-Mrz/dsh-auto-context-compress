@@ -1,10 +1,11 @@
 {
   "name": "dsh-auto-context-compress",
-  "version": "0.2.0",
-  "description": "DSH 自动上下文压缩：主动识别每个会话的上下文压力，裁剪超长工具输出前先向用户展示详情并请求确认，并提供跟随当前对话的浮动读数窗口",
+  "version": "0.3.0",
+  "description": "DSH 自动上下文压缩：主动识别每个会话的上下文压力，裁剪超长工具输出前先向用户展示详情并请求确认，并提供跟随当前对话的浮动读数窗口（适配 DSH 0.2.1 Web 与桌面端）",
   "type": "module",
   "engines": {
-    "node": "^22.19.0 || >=24.0.0"
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
   },
   "main": "lib/index.js",
   "exports": {
@@ -17,9 +18,7 @@
     "./package.json": "./package.json"
   },
   "dsh": {
-    "engines": {
-      "dsh": ">=0.1.1-rc.1"
-    },
+    "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
     },

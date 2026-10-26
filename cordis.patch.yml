@@ -1,5 +1,10 @@
 # dsh-auto-context-compress bundle patch.
 #
+# Targets DSH 0.2.1 (0.2.1-rc.2 and later). Web and Desktop compose the same
+# `dsh-web-app` host surface, so this host-plane row needs no platform branch:
+# Desktop serves the browser client from `dsh-app://app/` and forwards its
+# same-origin `api/...` requests to this process's loopback webServer.
+#
 # One HOST-plane row, and it has to be host plane:
 #
 #   * it observes `agent/pre-step` for EVERY session, so it cannot live inside

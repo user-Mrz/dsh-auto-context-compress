@@ -10,6 +10,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { apply, inject, name, resolveConfig } from '../lib/index.js'
 
 const CONFIRM_LABEL = '确认裁剪'
@@ -24,6 +25,13 @@ assert.deepEqual(
   'the web carrier MUST be a real dependency, or apply() runs before it exists and the route is never created',
 )
 assert.equal(typeof apply, 'function')
+
+// ── 0.2.1 manifest: engines.dsh is top-level, not dsh.engines ───────────────
+const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+assert.equal(pkg.dsh.manifestVersion, 1, 'the 0.2 manifest format is declared')
+assert.equal(pkg.engines.dsh, '>=0.2.1-rc.2 <0.3.0-0', 'the compatibility gate names the runtime this plugin targets')
+assert.equal(pkg.dsh.engines, undefined, 'the legacy dsh.engines location is gone; only the top-level one is read')
+assert.equal(pkg.dsh.client.platform, 'web', 'Desktop runs the same web client platform')
 
 // ── config validation ───────────────────────────────────────────────────────
 const defaults = resolveConfig({})
@@ -44,8 +52,27 @@ assert.throws(() => resolveConfig({ confirm: 'yes' }), /confirm must be a boolea
 assert.throws(() => resolveConfig({ maxDetailCandidates: 0 }), /must be an integer >= 1/)
 
 // ── a fake host context good enough to drive apply() ────────────────────────
-/** A tool/result big enough to prune, at a per-session seq. */
-function bigResult(seq, callId, tool) {
+/** A 0.2-shaped tool/result big enough to prune, at a per-session seq. */
+function bigResult(seq, callId) {
+  return {
+    type: 'tool/result',
+    seq,
+    sourceEventSeqs: [seq - 1],
+    data: {
+      turn: 1,
+      step: 1,
+      message: {
+        role: 'tool',
+        source: { kind: 'tool', callId },
+        toolCallId: callId,
+        content: [{ type: 'text', text: BIG_TEXT }],
+      },
+    },
+  }
+}
+
+/** A 0.1-shaped tool/result, kept to prove the compatibility fallback still reads it. */
+function legacyBigResult(seq, callId, tool) {
   return {
     type: 'tool/result',
     seq,
@@ -123,7 +150,12 @@ function buildHarness(options = {}) {
     },
     get: (key) => {
       if (key === 'tokenMeter') return ctx.tokenMeter
-      if (key === 'timer') return { timeout: options.timeout ?? (() => new Promise(() => {})) }
+      if (key === 'timer') {
+        return options.timer ?? { timeout: options.timeout ?? (() => new Promise(() => {})) }
+      }
+      if (key === 'profileContext') {
+        return options.profile === undefined ? undefined : { name: options.profile }
+      }
       if (key === 'agentPresets') {
         return {
           serviceFor: (_agent, serviceName) =>
@@ -161,11 +193,27 @@ function buildHarness(options = {}) {
         if (options.query === false) return undefined
         return {
           readSurface: async (sessionId) => ({
-            events: [
-              { type: 'user/message', seq: 1, data: {} },
-              bigResult(sessionId === 'session-2' ? 55 : 5, `call-${sessionId}`, sessionId === 'session-2' ? 'grep' : 'read'),
-              { type: 'tool/result', seq: 7, data: { message: { callId: 'small', name: 'ls', content: [{ type: 'text', text: 'tiny' }] } } },
-            ],
+            events: options.legacy
+              ? [legacyBigResult(5, 'legacy-call', 'legacy-tool')]
+              : [
+                  { type: 'user/message', seq: 1, data: {} },
+                  bigResult(sessionId === 'session-2' ? 55 : 5, `call-${sessionId}`),
+                  {
+                    type: 'tool/result',
+                    seq: 7,
+                    data: { message: { callId: 'small', name: 'ls', content: [{ type: 'text', text: 'tiny' }] } },
+                  },
+                ],
+          }),
+          readEvent: async ({ sessionId, seq }) => ({
+            target: {
+              type: 'tool/call',
+              seq,
+              data: {
+                callId: `call-${sessionId}`,
+                name: sessionId === 'session-2' ? 'grep' : 'read',
+              },
+            },
           }),
         }
       }
@@ -200,9 +248,10 @@ function buildHarness(options = {}) {
         }
       }
     },
-    async dispatch(sessionId = sessionIds[0], turn = 1) {
+    async dispatch(sessionId = sessionIds[0], turn = 1, step = 1) {
       const session = live.get(sessionId)
-      const payload = { agent: { id: sessionId, session }, turn, step: 1, signal: { aborted: false } }
+      const payload = { agent: { id: sessionId, session }, step, signal: { aborted: false } }
+      if (turn !== null) payload.turn = turn
       return state.listener(payload, () => {
         state.nextCalls += 1
         return 'next-result'
@@ -467,4 +516,50 @@ function buildHarness(options = {}) {
   assert.equal(h.state.asked, 1, 'and therefore must not produce a second confirmation card')
 }
 
-console.log('smoke: all 17 scenarios passed')
+// ── 18. a 0.1-shaped tool result still yields its call id and tool name ─────
+{
+  const h = buildHarness({ legacy: true })
+  apply(h.ctx, {})
+  await h.dispatch()
+  const question = h.state.questions[0]
+  assert.match(question.detail, /callId legacy-call/, 'the legacy flat callId is still read')
+  assert.match(question.detail, /工具 `legacy-tool`/, 'the legacy flat tool name is still read')
+  assert.equal(h.state.pruned.get('session-1'), 1)
+}
+
+// ── 19. without a turn number, a step reset starts a new question epoch ─────
+{
+  const h = buildHarness({ answer: SKIP_LABEL })
+  apply(h.ctx, {})
+  await h.dispatch('session-1', null, 1)
+  await h.dispatch('session-1', null, 2)
+  assert.equal(h.state.asked, 1, 'steps inside one turn must ask only once')
+  await h.dispatch('session-1', null, 1)
+  assert.equal(h.state.asked, 2, 'a backwards step marks the next turn rather than suppressing every later turn')
+}
+
+// ── 20. a disposed Cordis timer rejects: still fail-closed, never unhandled ─
+{
+  const h = buildHarness({
+    timer: { timeout: () => Promise.reject(new Error('Context has been disposed')) },
+    onAsk: (request) =>
+      new Promise((_resolve, reject) => {
+        request.signal.addEventListener('abort', () => reject(new Error('aborted')))
+      }),
+  })
+  apply(h.ctx, {})
+  await h.dispatch()
+  assert.equal(h.state.asked, 1)
+  assert.equal(h.state.pruned.size, 0, 'a rejected timer must behave like an expiry')
+}
+
+// ── 21. the readout names the surface it runs on (desktop vs web) ────────────
+{
+  const h = buildHarness({ sessionIds: ['session-1'], profile: 'desktop' })
+  apply(h.ctx, {})
+  const res = await h.callRoute('/api/auto-context-compress')
+  assert.equal(res.body.capabilities.platform, 'desktop', 'desktop is reported, not guessed')
+  assert.equal(res.body.capabilities.route, true, 'the desktop shell forwards this route to the loopback host')
+}
+
+console.log('smoke: all 21 scenarios passed')

@@ -179,31 +179,73 @@ assert.equal(typeof exportsObj.apply, 'function')
 assert.deepEqual(Array.from(exportsObj.inject), ['sessions'])
 
 // ── 2. apply renders a box with the current conversation's capacity ─────────
-let disposer = null
-const fakeCtx = {
-  effect(fn, label) {
-    assert.equal(label, 'dsh-auto-context-compress: overlay')
-    disposer = fn()
-    return disposer
-  },
-  get(name) {
-    if (name !== 'sessions') return undefined
-    return {
-      list: {
-        getSnapshot: () => ({ current: state.current }),
-        subscribe: (fn) => {
-          state.subscribeRef = fn
-          return () => {
-            state.unsubscribed = true
-          }
-        },
+function makeContext(options = {}) {
+  const local = {
+    currentId: options.currentId ?? 'session-A',
+    listSubscriber: null,
+    currentSubscriber: null,
+    listUnsubscribed: false,
+    currentUnsubscribed: false,
+    ui: undefined,
+  }
+  const makeUi = () => ({
+    current: {
+      getSnapshot: () => ({ key: local.currentId }),
+      subscribe: (fn) => {
+        local.currentSubscriber = fn
+        return () => {
+          local.currentUnsubscribed = true
+        }
       },
-    }
-  },
+    },
+  })
+  if (options.uiSession !== false) local.ui = makeUi()
+  const sessions = {
+    list: {
+      // DSH 0.2: { ids, byId, phase }. 0.1 kept a flat `current`; the list rows
+      // carry `retainedBy.mainView`, which is what the shipped UI reads.
+      getSnapshot: () =>
+        options.legacyCurrent !== undefined
+          ? { current: options.legacyCurrent }
+          : {
+              ids: Object.keys(options.byId ?? defaultRows),
+              byId: options.byId ?? defaultRows,
+              phase: 'ready',
+            },
+      subscribe: (fn) => {
+        local.listSubscriber = fn
+        return () => {
+          local.listUnsubscribed = true
+        }
+      },
+    },
+  }
+  local.ctx = {
+    effect(fn, label) {
+      assert.equal(label, 'dsh-auto-context-compress: overlay')
+      local.disposer = fn()
+      return local.disposer
+    },
+    get(name) {
+      if (name === 'sessions') return sessions
+      if (name === 'uiSession') return local.ui
+      return undefined
+    },
+  }
+  local.enableUi = () => {
+    local.ui = makeUi()
+  }
+  return local
 }
 
-exportsObj.apply(fakeCtx, { pollMs: 2000, position: 'top-right', visible: true })
-assert.equal(typeof disposer, 'function', 'apply must install a disposer through ctx.effect')
+const defaultRows = {
+  'session-A': { id: 'session-A', retainedBy: { mainView: 1 } },
+  'session-B': { id: 'session-B', retainedBy: {} },
+}
+
+const first = makeContext({ currentId: 'session-A' })
+exportsObj.apply(first.ctx, { pollMs: 2000, position: 'top-right', visible: true })
+assert.equal(typeof first.disposer, 'function', 'apply must install a disposer through ctx.effect')
 assert.equal(body.children.length, 1, 'the overlay box must be appended to document.body')
 
 const box = body.children[0]
@@ -215,7 +257,11 @@ await tick()
 
 assert.equal(box.attributes['data-level'], 'ok', 'the level drives the colour')
 assert.equal(state.fetches.length >= 1, true, 'it must poll the host route')
-assert.match(state.fetches[0], /^\/api\/auto-context-compress\?session=session-A$/)
+assert.match(
+  state.fetches[0],
+  /^api\/auto-context-compress\?session=session-A$/,
+  'the route is document-relative so path-prefixed Web and dsh-app:// both resolve',
+)
 
 const bodyEl = box.children.find((c) => c.dataset.acx === 'body')
 assert.match(bodyEl.textContent, /demo 对话/)
@@ -232,10 +278,11 @@ assert.match(allText, /已裁剪 3 条/, 'the prune tally must be rendered')
 assert.match(allText, /41\.2k/, 'the reclaimed tokens must be rendered')
 assert.match(allText, /系统 4\.5k/)
 
-// ── 3. it follows a conversation switch ─────────────────────────────────────
-assert.equal(typeof state.subscribeRef, 'function', 'it must subscribe to the session list')
-state.current = 'session-B'
-state.subscribeRef()
+// ── 3. it follows `uiSession.current` when the conversation switches ────────
+assert.equal(typeof first.currentSubscriber, 'function', 'it must subscribe to uiSession.current')
+assert.equal(typeof first.listSubscriber, 'function', 'it must also subscribe to the session list')
+first.currentId = 'session-B'
+first.currentSubscriber()
 await tick()
 await tick()
 assert.match(
@@ -263,9 +310,64 @@ assert.match(state.fetches[state.fetches.length - 1], /force=prune/, 'the button
 
 // ── 5. dispose removes every node, listener and the stylesheet ──────────────
 assert.equal(head.children.length, 1, 'the stylesheet tag must exist while mounted')
-disposer()
+first.disposer()
 assert.equal(body.children.length, 0, 'dispose must remove the overlay from the page')
 assert.equal(head.children.length, 0, 'dispose must remove the stylesheet')
-assert.equal(state.unsubscribed, true, 'dispose must unsubscribe from the session list')
+assert.equal(first.listUnsubscribed, true, 'dispose must unsubscribe from the session list')
+assert.equal(first.currentUnsubscribed, true, 'dispose must unsubscribe from uiSession.current')
 
-console.log('client-check: all 5 groups passed')
+// ── 6. no uiSession yet: the retention count still picks the main dialog ────
+{
+  const rows = {
+    'session-A': { id: 'session-A', retainedBy: {} },
+    'session-B': { id: 'session-B', retainedBy: { mainView: 1 } },
+  }
+  const fallback = makeContext({ uiSession: false, byId: rows })
+  const before = state.fetches.length
+  exportsObj.apply(fallback.ctx, { visible: true })
+  await tick()
+  await tick()
+  assert.equal(state.fetches.length, before + 1, 'a session must be found without uiSession')
+  assert.match(state.fetches[state.fetches.length - 1], /session=session-B$/)
+  fallback.disposer()
+  assert.equal(body.children.length, 0)
+  assert.equal(head.children.length, 0)
+}
+
+// ── 7. a late uiSession is adopted on the next refresh ──────────────────────
+{
+  const late = makeContext({
+    uiSession: false,
+    byId: { 'session-A': { id: 'session-A', retainedBy: {} } },
+  })
+  const before = state.fetches.length
+  exportsObj.apply(late.ctx, { visible: true })
+  await tick()
+  await tick()
+  assert.equal(state.fetches.length, before, 'no current dialog means no session request')
+
+  late.currentId = 'session-C'
+  late.enableUi()
+  late.listSubscriber()
+  await tick()
+  await tick()
+  assert.match(state.fetches[state.fetches.length - 1], /session=session-C$/, 'the late service is picked up')
+  late.disposer()
+  assert.equal(body.children.length, 0)
+  assert.equal(head.children.length, 0)
+  assert.equal(late.currentUnsubscribed, true, 'the late subscription is released on dispose')
+}
+
+// ── 8. the 0.1 flat `current` snapshot is still readable ────────────────────
+{
+  const legacy = makeContext({ uiSession: false, legacyCurrent: 'session-B' })
+  exportsObj.apply(legacy.ctx, { visible: true })
+  await tick()
+  await tick()
+  assert.match(state.fetches[state.fetches.length - 1], /session=session-B$/, 'the legacy shape is a fallback')
+  legacy.disposer()
+  assert.equal(body.children.length, 0)
+  assert.equal(head.children.length, 0)
+}
+
+console.log('client-check: all 8 groups passed')
